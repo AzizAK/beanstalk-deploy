@@ -146,7 +146,8 @@ function expect(status, result, extraErrorMessage) {
 }
 
 //Uploads zip file, creates new version and deploys it
-function deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, solutionStackName) {
+function deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, 
+    createNewEnvrionmentIfNotExist, solutionStackName) {
 
     //Lots of characters that will mess up an S3 filename, so only allow alphanumeric, - and _ in the actual file name. 
     //The version label can still contain all that other stuff though.
@@ -180,9 +181,13 @@ function deployNewVersion(application, environmentName, versionLabel, versionDes
         return describeEnvironments(application, environmentName);
     }).then(result => {
         expect(200, result);
-        if(result.data.DescribeEnvironmentsResponse.Environments == null) { // Environment not found
+        console.log(result.data.DescribeEnvironmentsResponse.DescribeEnvironmentsResult)
+        if(result.data.DescribeEnvironmentsResponse.DescribeEnvironmentsResult.Environments == null) { // Environment not found
             createNewEnv = true;
             console.log(`Envrionment ${environmentName} not found, creating new one`);
+            if(createNewEnvrionmentIfNotExist && solutionStackName == null) {
+                throw new Error('please add solution stack name to create the environment')
+            }
             return createBeanstalkEnvironment(application, environmentName, solutionStackName);
         }
 
@@ -278,6 +283,8 @@ function main() {
         versionDescription,
         region, 
         file, 
+        solutionStackName,
+        createNewEnvrionmentIfNotExist = true,
         useExistingVersionIfAvailable, 
         waitForRecoverySeconds = 30, 
         waitUntilDeploymentIsFinished = true; //Whether or not to wait for the deployment to complete...
@@ -288,6 +295,7 @@ function main() {
         versionLabel = strip(process.env.INPUT_VERSION_LABEL);
         versionDescription = strip(process.env.INPUT_VERSION_DESCRIPTION);
         file = strip(process.env.INPUT_DEPLOYMENT_PACKAGE);
+        solutionStackName = strip(process.env.INPUT_SOLUTION_STACK_NAME);
 
         awsApiRequest.accessKey = strip(process.env.INPUT_AWS_ACCESS_KEY);
         awsApiRequest.secretKey = strip(process.env.INPUT_AWS_SECRET_KEY);
@@ -301,6 +309,11 @@ function main() {
         if (process.env.INPUT_WAIT_FOR_ENVIRONMENT_RECOVERY) {
             waitForRecoverySeconds = parseInt(process.env.INPUT_WAIT_FOR_ENVIRONMENT_RECOVERY);
         }
+
+        if ((process.env.INPUT_CREATE_NEW_ENVIRONMENT || '').toLowerCase() == 'false') {
+            createNewEnvrionmentIfNotExist = false;
+        }
+
         useExistingVersionIfAvailable = process.env.INPUT_USE_EXISTING_VERSION_IF_AVAILABLE == 'true' || process.env.INPUT_USE_EXISTING_VERSION_IF_AVAILABLE == 'True';
 
     } else { //Running as command line script
@@ -313,7 +326,7 @@ function main() {
             process.exit(1);
         }
 
-        [application, environmentName, versionLabel, region, file] = process.argv.slice(2);
+        [application, environmentName, versionLabel, region, file, createNewEnvrionmentIfNotExist, solutionStackName] = process.argv.slice(2);
         versionDescription = ''; //Not available for this.
         useExistingVersionIfAvailable = false; //This option is not available in the console version
 
@@ -345,16 +358,18 @@ function main() {
     }
 
     console.log(' ***** Input parameters were: ***** ');
-    console.log('         Application: ' + application);
-    console.log('         Environment: ' + environmentName);
-    console.log('       Version Label: ' + versionLabel);
-    console.log(' Version description: ' + versionDescription);
-    console.log('          AWS Region: ' + awsApiRequest.region);
-    console.log('                File: ' + file);
-    console.log('      AWS Access Key: ' + awsApiRequest.accessKey.length + ' characters long, starts with ' + awsApiRequest.accessKey.charAt(0));
-    console.log('      AWS Secret Key: ' + awsApiRequest.secretKey.length + ' characters long, starts with ' + awsApiRequest.secretKey.charAt(0));
-    console.log(' Wait for deployment: ' + waitUntilDeploymentIsFinished);
-    console.log('  Recovery wait time: ' + waitForRecoverySeconds);
+    console.log('                        Application: ' + application);
+    console.log('                        Environment: ' + environmentName);
+    console.log('                      Version Label: ' + versionLabel);
+    console.log('                Version description: ' + versionDescription);
+    console.log('                         AWS Region: ' + awsApiRequest.region);
+    console.log('                               File: ' + file);
+    console.log('                     AWS Access Key: ' + awsApiRequest.accessKey.length + ' characters long, starts with ' + awsApiRequest.accessKey.charAt(0));
+    console.log('                     AWS Secret Key: ' + awsApiRequest.secretKey.length + ' characters long, starts with ' + awsApiRequest.secretKey.charAt(0));
+    console.log('                Wait for deployment: ' + waitUntilDeploymentIsFinished);
+    console.log('                 Recovery wait time: ' + waitForRecoverySeconds);
+    console.log('Create new environment if not exist: ' + createNewEnvrionmentIfNotExist);
+    console.log('                Solution Stack Name: ' + solutionStackName);
     console.log('');
 
     getApplicationVersion(application, versionLabel).then(result => {
@@ -382,7 +397,7 @@ function main() {
             } 
         } else {
             if (file) {
-                deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, "64bit Amazon Linux 2 v2.1.5 running .NET Core");
+                deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, true, "64bit Amazon Linux 2 v2.1.5 running .NET Core");
             } else {
                 console.error(`Deployment failed: No deployment package given but version ${versionLabel} doesn't exist, so nothing to deploy!`);
                 process.exit(2);
