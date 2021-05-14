@@ -50,6 +50,22 @@ function uploadFileToS3(bucket, s3Key, filebuffer) {
     });
 }
 
+function createBeanstalkEnvironment(application, environmentName, solutionStackName) {
+    return awsApiRequest({
+        service: 'elasticbeanstalk',
+        querystring: {
+            Operation: 'CreateEnvironment', 
+            Version: '2010-12-01',
+            ApplicationName : application,
+            EnvironmentName : environmentName,
+            SolutionStackName : solutionStackName,
+            'OptionSettings.member.1.Namespace':  'aws:autoscaling:launchconfiguration',
+            'OptionSettings.member.1.OptionName': 'IamInstanceProfile',
+            'OptionSettings.member.1.Value': 'aws-elasticbeanstalk-ec2-role'
+        }
+    });
+}
+
 function createBeanstalkVersion(application, bucket, s3Key, versionLabel, versionDescription) {
     return awsApiRequest({
         service: 'elasticbeanstalk',
@@ -130,14 +146,15 @@ function expect(status, result, extraErrorMessage) {
 }
 
 //Uploads zip file, creates new version and deploys it
-function deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds) {
+function deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, solutionStackName) {
 
     //Lots of characters that will mess up an S3 filename, so only allow alphanumeric, - and _ in the actual file name. 
     //The version label can still contain all that other stuff though.
     let s3filename = versionLabel.replace(/[^a-zA-Z0-9-_]/g, '-');
 
     let s3Key = `/${application}/${s3filename}.zip`;
-    let bucket, deployStart, fileBuffer;
+    let bucket, deployStart, fileBuffer, newEnvironmentUrl, newEnvironmentCName;
+    let createNewEnv = false;
 
     readFile(file).then(result => {
         fileBuffer = result;
@@ -157,12 +174,31 @@ function deployNewVersion(application, environmentName, versionLabel, versionDes
         expect(200, result);
         console.log(`New build successfully uploaded to S3, bucket=${bucket}, key=${s3Key}`);
         return createBeanstalkVersion(application, bucket, s3Key, versionLabel, versionDescription);
-    }).then(result => {
+    }).then(result => {
         expect(200, result);
         console.log(`Created new application version ${versionLabel} in Beanstalk.`);
-        if (!environmentName) {
-            console.log(`No environment name given, so exiting now without deploying the new version ${versionLabel} anywhere.`);
-            process.exit(0);
+        return describeEnvironments(application, environmentName);
+    }).then(result => {
+        expect(200, result);
+        if(result.data.DescribeEnvironmentsResponse.Environments == null) { // Environment not found
+            createNewEnv = true;
+            console.log(`Envrionment ${environmentName} not found, creating new one`);
+            return createBeanstalkEnvironment(application, environmentName, solutionStackName);
+        }
+
+        return false;
+    }).then(result => {
+        if(result) {
+            expect(200, result);
+            console.log('creating enviroment started...\n');
+            return waitForEnvironmentCreation(application, environmentName, versionLabel, deployStart, waitForRecoverySeconds);
+        }
+
+        return false;
+    }).then(envAfterCreation => {
+        if(envAfterCreation) {
+            newEnvironmentUrl = envAfterCreation.EndpointURL;
+            newEnvironmentCName = envAfterCreation.CNAME;
         }
         deployStart = new Date();
         console.log(`Starting deployment of version ${versionLabel} to environment ${environmentName}`);
@@ -176,12 +212,18 @@ function deployNewVersion(application, environmentName, versionLabel, versionDes
         } else {
             console.log('Deployment started, parameter "wait_for_deployment" was false, so action is finished.');
             console.log('**** IMPORTANT: Please verify manually that the deployment succeeds!');
+            if(createNewEnv) {
+                console.log(`New environment Endpoint Url is: ${newEnvironmentUrl}, CName: ${newEnvironmentCName}`);
+            }
             process.exit(0);
         }
 
     }).then(envAfterDeployment => {
         if (envAfterDeployment.Health === 'Green') {
             console.log('Environment update successful!');
+            if(createNewEnv) {
+                console.log(`New environment Endpoint Url is: ${newEnvironmentUrl}, CName: ${newEnvironmentCName}`);
+            }
             process.exit(0);
         } else {
             console.warn(`Environment update finished, but environment health is: ${envAfterDeployment.Health}, HealthStatus: ${envAfterDeployment.HealthStatus}`);
@@ -340,7 +382,7 @@ function main() {
             } 
         } else {
             if (file) {
-                deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds);
+                deployNewVersion(application, environmentName, versionLabel, versionDescription, file, waitUntilDeploymentIsFinished, waitForRecoverySeconds, "64bit Amazon Linux 2 v2.1.5 running .NET Core");
             } else {
                 console.error(`Deployment failed: No deployment package given but version ${versionLabel} doesn't exist, so nothing to deploy!`);
                 process.exit(2);
@@ -480,6 +522,99 @@ function waitForDeployment(application, environmentName, versionLabel, start, wa
     });
 }
 
+//Wait until the new environment is created, printing any events happening during the wait...
+function waitForEnvironmentCreation(application, environmentName, waitForRecoverySeconds) {
+    let counter = 0;
+    let degraded = false;
+    let healThreshold;
+    let deploymentFailed = false;
+
+    const SECOND = 1000;
+    const MINUTE = 60 * SECOND;
+
+    let waitPeriod = 10 * SECOND; //Start at ten seconds, increase slowly, long deployments have been erroring with too many requests.
+    let waitStart = new Date().getTime();
+
+    let eventCalls = 0, environmentCalls = 0; // Getting throttled on these print out how many we're doing...
+
+    let consecutiveThrottleErrors = 0;
+
+    return new Promise((resolve, reject) => {
+        function update() {
+
+            let elapsed = new Date().getTime() - waitStart;
+            
+            //Limit update requests for really long deploys
+            if (elapsed > (10 * MINUTE)) {
+                waitPeriod = 30 * SECOND;
+            } else if (elapsed > 5 * MINUTE) {
+                waitPeriod = 20 * SECOND;
+            }
+
+
+            describeEnvironments(application, environmentName).then(result => {
+                environmentCalls++;
+
+                //Allow a few throttling failures...
+                if (result.statusCode === 400 && result.data && result.data.Error && result.data.Error.Code == 'Throttling') {
+                    consecutiveThrottleErrors++;
+                    console.log(`Request to DescribeEnvironments was throttled, that's ${consecutiveThrottleErrors} throttle errors in a row...`);
+                    if (consecutiveThrottleErrors >= 5) {
+                        throw new Error(`Environment failed, got ${consecutiveThrottleErrors} throttling errors in a row while waiting for creation`);
+                    }
+
+                    setTimeout(update, waitPeriod);
+                    return;
+                }
+
+                expect(200, result, `Failed in call to describeEnvironments, have done ${eventCalls} calls to describeEvents, ${environmentCalls} calls to describeEnvironments in ${formatTimespan(waitStart)}`);
+
+                consecutiveThrottleErrors = 0;
+                counter++;
+                let env = result.data.DescribeEnvironmentsResponse.DescribeEnvironmentsResult.Environments[0];
+
+                if (env.Status === 'Ready') {
+                    if (!degraded) {
+                        console.log(`Envrionment ${environmentName} created.`);
+                        console.log(`Status for ${application}-${environmentName} is ${env.Status}, Health: ${env.Health}, HealthStatus: ${env.HealthStatus}`);
+                       
+                        if (env.Health === 'Green') {
+                            resolve(env);   
+                        } else {
+                            console.warn(`Environment update finished, but health is ${env.Health} and health status is ${env.HealthStatus}. Giving it ${waitForRecoverySeconds} seconds to recover...`);
+                            degraded = true;
+                            healThreshold = new Date(new Date().getTime() + waitForRecoverySeconds * SECOND);
+                            setTimeout(update, waitPeriod);
+                        }
+                    } else {
+                        if (env.Health === 'Green') {
+                            console.log(`Environment has recovered, health is now ${env.Health}, health status is ${env.HealthStatus}`);
+                            resolve(env);
+                        } else {
+                            if (new Date().getTime() > healThreshold.getTime()) {
+                                reject(new Error(`Environment still has health ${env.Health} ${waitForRecoverySeconds} seconds after update finished!`));
+                            } else {
+                                let left = Math.floor((healThreshold.getTime() - new Date().getTime()) / 1000);
+                                console.warn(`Environment still has health: ${env.Health} and health status ${env.HealthStatus}. Waiting ${left} more seconds before failing...`);
+                                setTimeout(update, waitPeriod);
+                            }
+                        }
+                    }
+                } else if (deploymentFailed) {
+                    let msg = `Deployment failed! Current State: Version: ${env.VersionLabel}, Health: ${env.Health}, Health Status: ${env.HealthStatus}`;
+                    console.log(`${new Date().toISOString().substr(11,8)} ERROR: ${msg}`);
+                    reject(new Error(msg));
+                } else {
+                    if (counter % 6 === 0 && !deploymentFailed) {
+                        console.log(`${new Date().toISOString().substr(11,8)} INFO: Still updating, status is "${env.Status}", health is "${env.Health}", health status is "${env.HealthStatus}"`);
+                    }
+                    setTimeout(update, waitPeriod);
+                }
+            }).catch(reject);
+        }
+    
+        update();
+    });
+}
+
 main();
-
-
